@@ -1,0 +1,316 @@
+<!doctype html>
+<html>
+<meta charset="utf-8">
+<link rel="stylesheet" href="codemirror.css" />
+<style>
+
+.CodeMirror {
+	border: 1px solid black;
+}
+
+body {
+  font: 18px sans-serif;
+}
+
+.bar rect {
+  fill: steelblue;
+  shape-rendering: crispEdges;
+}
+
+.bar text {
+  fill: #fff;
+}
+
+.axis path, .axis line {
+  fill: none;
+  stroke: #000;
+  shape-rendering: crispEdges;
+}
+
+</style>
+
+<div id="tools">
+	<button class="start">Start Recording</button>
+	<button class="stop">Stop Recording</button>
+	<button class="add-video">Add Video</button>
+</div>
+
+<textarea></textarea>
+
+<div id="video"></div>
+
+<script src="codemirror.js"></script>
+<script src="d3.v3.js"></script>
+<script src="jquery.js"></script>
+<script src="underscore.js"></script>
+<script>
+$(function () {
+	var recording = Recording();
+
+	var $textarea = $("textarea");
+	var editor = CodeMirror.fromTextArea($textarea[0]);
+	editor.focus();
+
+	editor.on("change", function (editor, change) {
+		if (recording) {
+			var time = new Date;
+			do {
+				recording.splice(change.from, change.to, CodeMirror.changeEnd(change), time);
+			} while (change = change.next);
+		}
+	});
+
+	editor.on("cursorActivity", _.debounce(function () {
+		if (recording) {
+			Bar(recording.timeOffsetsForRange(editor.getCursor("start"), editor.getCursor("end")), recording.duration());
+		}
+	}, 300));
+
+	$("#tools .start").on("click", function () {
+		console.log("starting a new recording");
+		recording = Recording();
+	});
+
+	$("#tools .stop").on("click", function () {
+		if (recording) {
+			console.log("stopping recording");
+			recording.stop();
+		}
+	});
+
+	$("#tools .add-video").on("click", function () {
+		var $video = $("<video />", { src: prompt() });
+		$("#video").empty().append($video);
+
+		$(document).on("video-seek", function (e, time) {
+			$video[0].currentTime = time;
+			$video[0].play();
+		});
+	});
+
+	$("#tools .export").on("click", function () {
+		if (recording) {
+			console.log(JSON.stringify(recording));
+		}
+	});
+});
+
+// values is an array of numbers indicating seconds since the start
+function Bar(values, range) {
+	// values = d3.range(1000).map(d3.random.logNormal(Math.log(30), .4));
+
+	// Formatters for counts and times (converting numbers to Dates).
+	var formatCount = d3.format(",.0f"),
+	    formatTime = d3.time.format("%H:%M"),
+	    formatMinutes = function(d) { return formatTime(new Date(2012, 0, 1, 0, d)); };
+
+	var margin = {top: 10, right: 30, bottom: 30, left: 30},
+	    width = 960 - margin.left - margin.right,
+	    height = 200 - margin.top - margin.bottom;
+
+	var x = d3.scale.linear()
+	    .domain([0, Math.floor(range)])
+	    .range([0, width]);
+
+	// Generate a histogram using XXX uniformly-spaced bins.
+	var data = d3.layout.histogram()
+	    .bins(x.ticks(60))
+	    (values);
+
+	var y = d3.scale.linear()
+	    .domain([0, d3.max(data, function(d) { return d.y; })])
+	    .range([height, 0]);
+
+	var xAxis = d3.svg.axis()
+	    .scale(x)
+	    .orient("bottom")
+	    .tickFormat(formatMinutes);
+
+	d3.select("body").select("svg").remove()
+	var svg = d3.select("body").append("svg")
+	    .attr("width", width + margin.left + margin.right)
+	    .attr("height", height + margin.top + margin.bottom)
+	  .append("g")
+	    .attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+	var bar = svg.selectAll(".bar")
+	    .data(data)
+	  .enter().append("g")
+	    .attr("class", "bar")
+	    .attr("transform", function(d) { return "translate(" + x(d.x) + "," + y(d.y) + ")"; });
+
+	bar.on("click", function (d) {
+		$(document).trigger("video-seek", d.x);
+	});
+
+	bar.append("rect")
+	    .attr("x", 1)
+	    .attr("width", x(data[0].dx) - 1)
+	    .attr("height", function(d) { return height - y(d.y); });
+
+	bar.append("text")
+	    .attr("dy", ".75em")
+	    .attr("y", 6)
+	    .attr("x", x(data[0].dx) / 2)
+	    .attr("text-anchor", "middle")
+	    .text(function(d) { return formatCount(d.y); });
+
+	svg.append("g")
+	    .attr("class", "x axis")
+	    .attr("transform", "translate(0," + height + ")")
+	    .call(xAxis);
+}
+
+function Recording() {
+	var ranges = [];
+	var startTime = new Date;
+	var stopTime;
+
+	return {
+		// Call whenever a chance occurs in the code.
+		// [from, oldTo]: the range of text that was deleted
+		// [from, newTo]: the range of text it was replaced with
+		// time: the time the change occurred (a Date)
+		// from, oldTo, and newTo are objects like { line: 0, ch: 0 }
+		splice: function (from, oldTo, newTo, time) {
+			var newRange = {
+				from: from,
+				to: newTo,
+				time: time,
+			};
+
+			var locChange = {
+				line: newTo.line - oldTo.line,
+				ch: newTo.ch - oldTo.ch,
+			};
+
+			if (ranges.length > 0) {
+				var insertAt; // index where the new range will be inserted
+
+				for (var i = 0; i < ranges.length; i++) {
+					var range = ranges[i];
+
+					// skip ranges that end before the change point
+					if (compareLoc(range.to, from) < 0) {
+						// skip
+					} else if (compareLoc(range.to, oldTo) <= 0) {
+						// truncate the ends of ranges that end before the change point ends
+
+						// truncate to end before the change point
+						range.to = locDup(from);
+
+						// if the range now ends before it begins, move its starting point back
+						if (compareLoc(range.to, range.from) < 0) {
+							range.from = locDup(range.to);
+						}
+
+						insertAt = i + 1;
+					} else {
+						// truncate the beginning of ranges that end after the change point ends
+
+						// range ends PAST the end of the change
+						// if it also begins BEFORE the start of the change, we need to split it in two
+						if (compareLoc(range.from, from) < 0) {
+							ranges.splice(i, 0, {
+								from: range.from,
+								to: from,
+								time: range.time,
+							});
+							insertAt = ++i;
+						}
+
+						// truncate the beginning: range.from = max(range.from, oldTo)
+						if (compareLoc(oldTo, range.from) > 0) {
+							range.from = locDup(oldTo);
+						}
+
+						// offset locations
+						if (oldTo.line === range.from.line) range.from.ch += locChange.ch;
+						range.from.line += locChange.line;
+
+						if (oldTo.line === range.to.line) range.to.ch += locChange.ch;
+						range.to.line += locChange.line;
+
+						if (insertAt === undefined) {
+							insertAt = i;
+						}
+					}
+				}
+
+				console.assert(insertAt !== undefined);
+				ranges.splice(insertAt, 0, newRange);
+			} else {
+				ranges.push(newRange);
+			}
+
+			// assertion: each range's end should be the next range's start
+			for (var i = 0; i < ranges.length - 1; i++) {
+				console.assert(ranges[i].to.line === ranges[i+1].from.line);
+				console.assert(ranges[i].to.ch === ranges[i+1].from.ch);
+			}
+		},
+
+		timesForRange: function (from, to) {
+			return _.chain(ranges)
+				.filter(function (range) {
+					return intersects(from, to, range.from, range.to);
+				})
+				.map(function (range) {
+					return range.time;
+				})
+				.sort()
+				.uniq()
+				.value();
+		},
+
+		timeOffsetsForRange: function (from, to) {
+			return _.map(this.timesForRange(from, to), function (time) { return (time - startTime) / 1000 });
+		},
+
+		duration: function () {
+			return ((stopTime || (new Date)) - startTime) / 1000;
+		},
+
+		stop: function () {
+			stopTime = new Date;
+		},
+
+		toJSON: function () {
+			return { ranges: ranges };
+		},
+	};
+
+	// from <= loc <= to
+	function contains(from, to, loc) {
+		return compareLoc(from, loc) <= 0 && compareLoc(loc, to) <= 0;
+	}
+
+	function intersects(from1, to1, from2, to2) {
+		// from1 <= to2, to1 >= from2
+		return compareLoc(from1, to2) <= 0 && compareLoc(to1, from2) >= 0;
+	}
+
+	function compareLoc(locA, locB) {
+		var lineComparison = compareNum(locA.line, locB.line);
+		if (lineComparison === 0) {
+			return compareNum(locA.ch, locB.ch);
+		} else {
+			return lineComparison;
+		}
+
+		function compareNum(a, b) {
+			if (a < b) return -1;
+			if (a === b) return 0;
+			return 1;
+		}
+	}
+
+	function locDup(loc) {
+		return { line: loc.line, ch: loc.ch };
+	}
+
+	// for debugging
+	function locStr(loc) { return "(" + loc.line + ", " + loc.ch + ")" }
+	function rangeStr(range) { return locStr(range.from) + "-" + locStr(range.to) }
+}
+</script>
